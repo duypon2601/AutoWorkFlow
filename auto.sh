@@ -33,6 +33,8 @@
 #                          rỗng = nhắc agent không dùng MCP, chỉ dùng lệnh CLI
 #   AGY_TOKEN_WARN=3000000 cảnh báo khi tổng token input của agy trong một task vượt ngưỡng (0 = tắt);
 #                          số lần gọi model / token của agy từng task ghi trong summary.md
+#   AGY_WATCH=1            in từng bước agy đang làm (đọc file, chạy lệnh, sửa file, lỗi) ra màn hình khi chạy task;
+#                          ghi thêm vào .auto-logs/task<N>-try<M>-code.log.steps (0 = tắt; cần Python có sqlite3)
 # Ví dụ:
 #   REVIEW_MODEL=haiku ./auto.sh
 #   CODER=gemini ./auto.sh
@@ -129,6 +131,14 @@ AGY_ALLOWED_CMDS="${AGY_ALLOWED_CMDS:-git, python3, .venv/bin/python, .venv/bin/
 AGY_ALLOW_MCP="${AGY_ALLOW_MCP:-}"
 # Cảnh báo khi tổng token input của agy trong một task vượt ngưỡng này (0 = tắt)
 AGY_TOKEN_WARN="${AGY_TOKEN_WARN:-3000000}"
+# In từng bước agy đang làm ra màn hình khi chạy task (0 = tắt)
+AGY_WATCH="${AGY_WATCH:-1}"
+# Python thật (có sqlite3) để đọc hội thoại agy. Trên Windows `python3` có thể chỉ là lối tắt Microsoft Store:
+# có trong PATH nhưng chạy là lỗi → thử chạy thật thay vì `command -v`.
+PY=""
+for p in python3 python; do "$p" -c 'import sqlite3' >/dev/null 2>&1 && { PY=$p; break; }; done
+# Đường dẫn đưa cho Python qua stdin: trên Git Bash đổi /c/... thành C:\... (tham số dòng lệnh thì MSYS tự đổi)
+py_paths() { if command -v cygpath >/dev/null; then cygpath -w -f -; else cat; fi; }
 # Chỉ dùng khi test: thay thời gian chờ hạn mức bằng số giây này
 AUTOWF_TEST_WAIT_SECS="${AUTOWF_TEST_WAIT_SECS:-}"
 AGY_CONFIG="${AGY_CONFIG:-$HOME/.gemini/config/config.json}"
@@ -342,14 +352,103 @@ Cách xử lý: git stash list; lấy lại bằng git stash pop (nếu đúng l
   fi
 }
 
+# ---- AGY_WATCH: in từng bước agy đang làm trong lúc nó chạy ----
+# agy -p chỉ in câu trả lời cuối; còn từng lệnh gọi công cụ thì nó ghi dần vào hội thoại
+# $AGY_CONV_DIR/<id>.db (SQLite, WAL): bảng steps, step_type 132 = gọi công cụ, payload chứa
+# `call_N <tool> {json tham số}`; status 3 = xong, 7 = lỗi (error_details), 6 = bị dừng/từ chối
+# (suy ra từ dữ liệu thật). Best-effort: đọc không được thì im lặng.
+AGY_WATCH_PY='
+import json, os, re, sqlite3, sys, time
+conv, start, stop, out = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception: pass
+cwd = os.getcwd().replace("\\", "/").rstrip("/") + "/"
+dec = json.JSONDecoder()
+state = {}  # db -> {idx: đã báo xong?}
+def rel(p):
+    p = str(p).replace("\\", "/")
+    return p[len(cwd):] if p.lower().startswith(cwd.lower()) else p
+def describe(name, a):
+    if a.get("CommandLine"): return "$ " + a["CommandLine"]
+    path, note = a.get("AbsolutePath") or a.get("TargetFile"), a.get("Description") or a.get("toolSummary") or ""
+    if name == "view_file" and path:
+        return "👀 " + rel(path) + (" (dòng %s-%s)" % (a["StartLine"], a["EndLine"]) if "StartLine" in a and "EndLine" in a else "")
+    if path: return "✏️ " + rel(path) + (" — " + note if note else "")
+    return "🔧 " + name + (" — " + note if note else "")
+def emit(text):
+    text = re.sub(r"[A-Za-z]:/[^ ]*?/antigravity-cli/brain/[^/ ]+/|/[^ ]*?/antigravity-cli/brain/[^/ ]+/", "<nháp agy>/", text)
+    line = time.strftime("%H:%M:%S") + " " + " ".join(text.split())[:220]
+    try: print("   " + line, flush=True)
+    except OSError: pass
+    with open(out, "a", encoding="utf-8") as f: f.write(line + "\n")
+def parse(p):
+    m = re.search(rb"call_\d+", p or b"")
+    if not m: return None
+    j = p.find(b"{\"", m.end())
+    if j < 0: return None
+    names = re.findall(rb"[a-z_][a-z0-9_]{2,}", p[m.end():j])
+    try: args, _ = dec.raw_decode(p[j:].decode("utf-8", "replace"))
+    except ValueError: return None
+    return (names[-1].decode() if names else "?"), args
+def scan():
+    try: files = [f for f in os.listdir(conv) if f.endswith(".db")]
+    except OSError: return
+    for f in files:
+        db = os.path.join(conv, f)
+        try: mt = max(os.path.getmtime(x) for x in (db, db + "-wal") if os.path.exists(x))
+        except (OSError, ValueError): continue
+        if f not in state and mt < start - 2: continue
+        seen = state.setdefault(f, {})
+        try:
+            con = sqlite3.connect("file:" + db.replace("\\", "/") + "?mode=ro", uri=True, timeout=2)
+            rows = con.execute("select idx, status, step_payload, error_details from steps where step_type = 132 order by idx").fetchall()
+            con.close()
+        except sqlite3.Error: continue
+        for idx, status, payload, err in rows:
+            if seen.get(idx): continue
+            if idx not in seen:
+                call = parse(payload)
+                if call: emit(describe(*call))
+                seen[idx] = False
+            if status == 7:
+                msg = (err or b"").decode("utf-8", "replace") if isinstance(err, bytes) else str(err or "")
+                emit("   ❌ lỗi: " + (re.sub(r"[^ -~À-ỹ]+", " ", msg).strip() or "(không rõ)"))
+            elif status == 6: emit("   ⛔ bị dừng/từ chối")
+            if status in (3, 6, 7): seen[idx] = True
+while True:
+    last = os.path.exists(stop)
+    scan()
+    if last: break
+    time.sleep(1.5)
+'
+AGY_WATCH_PID=""
+agy_watch_start() {  # <file log> — chạy nền, in các bước của agy và ghi vào <log>.steps
+  AGY_WATCH_PID=""
+  [ "$AGY_WATCH" = 1 ] && [ -n "$PY" ] && [ -d "$AGY_CONV_DIR" ] || return 0
+  rm -f "$LOG_DIR/.watch-stop" "$1.steps"
+  "$PY" -c "$AGY_WATCH_PY" "$AGY_CONV_DIR" "$(date +%s)" "$LOG_DIR/.watch-stop" "$1.steps" 2>/dev/null &
+  AGY_WATCH_PID=$!
+}
+agy_watch_stop() {  # quét lần cuối rồi dừng (tối đa ~10 giây)
+  local i=0
+  [ -n "$AGY_WATCH_PID" ] || return 0
+  touch "$LOG_DIR/.watch-stop"
+  while kill -0 "$AGY_WATCH_PID" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+  kill "$AGY_WATCH_PID" 2>/dev/null || true
+  wait "$AGY_WATCH_PID" 2>/dev/null || true
+  rm -f "$LOG_DIR/.watch-stop"; AGY_WATCH_PID=""
+}
+
 run_coder() {  # <agent> <prompt> <file log>; mã thoát của agent lưu ở CODER_RC
   CODER_RC=0
   touch "$LOG_DIR/.coder-start"
+  [ "$1" != agy ] || agy_watch_start "$3"
   case "$1" in
     agy)    agy -p "$2 $AGY_RULES" ;;
     gemini) gemini -p "$2" --yolo ;;
     *)      "$1" -p "$2" ;;
   esac < /dev/null > "$3" 2>&1 || CODER_RC=$?
+  agy_watch_stop
   [ "$1" != agy ] || record_agy_usage "$3"
 }
 
@@ -360,8 +459,8 @@ run_coder() {  # <agent> <prompt> <file log>; mã thoát của agent lưu ở CO
 agy_usage() {
   local dbs
   dbs=$(find "$AGY_CONV_DIR" -name '*.db' -newer "$LOG_DIR/.coder-start" 2>/dev/null || true)
-  [ -n "$dbs" ] && command -v python3 >/dev/null || return 0
-  printf '%s\n' "$dbs" | python3 -c '
+  [ -n "$dbs" ] && [ -n "$PY" ] || return 0
+  printf '%s\n' "$dbs" | py_paths | "$PY" -c '
 import sqlite3, sys
 def varint(b, i):
     r = s = 0
@@ -436,8 +535,8 @@ agy_denied_commands() {
   conv=$(grep -oE 'Tool confirmation for conversation [0-9a-f-]+ step [0-9]+ \(type=[^)]*approved=false' "$AGY_HOME/cli.log" 2>/dev/null \
     | tail -n1 | sed -E 's/.*conversation ([0-9a-f-]+) .*/\1/')
   db="$AGY_HOME/conversations/$conv.db"
-  [ -n "$conv" ] && [ -f "$db" ] && command -v python3 >/dev/null || return 0
-  strings "$db" 2>/dev/null | python3 -c '
+  [ -n "$conv" ] && [ -f "$db" ] && [ -n "$PY" ] || return 0
+  strings "$db" 2>/dev/null | "$PY" -c '
 import json, re, sys
 try:
     allow = json.load(open(sys.argv[1]))["userSettings"]["globalPermissionGrants"]["allow"]
@@ -1162,7 +1261,7 @@ write_summary() {
   } > "$LOG_DIR/summary.md"
   echo "📝 Tóm tắt: $LOG_DIR/summary.md"
 }
-trap write_summary EXIT
+trap '[ -z "$AGY_WATCH_PID" ] || kill "$AGY_WATCH_PID" 2>/dev/null; write_summary' EXIT
 trap 'STOP_REASON="Bị ngắt (Ctrl-C/TERM)"; exit 130' INT TERM
 
 stop() {  # stop <exit code> <lý do> [chi tiết nhiều dòng]
