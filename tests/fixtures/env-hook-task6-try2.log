@@ -1,0 +1,30 @@
+Every tool call is currently being intercepted and blocked by the system's `PreToolUse` hook before execution can start.
+
+### Error Details
+
+```text
+JSON hook "jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0" failed: command failed: exit status 1
+stderr:
+Error: Cannot find module 'C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\"C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\telemetry_hook_bundle.js"'
+```
+
+### Cause
+
+On Windows, the `PreToolUse` hook runner is invoking Node with literal quotes around the path argument (`"C:\Users\..."`). Node resolves this relative to the working directory, producing an invalid path with embedded quotation marks and failing with `MODULE_NOT_FOUND`. Because `PreToolUse` hooks run before every single tool, all tool invocations (`view_file`, `write_to_file`, `run_command`, etc.) fail immediately.
+
+### How to Fix
+
+Please run one of the following steps on your host machine:
+
+1. **Option 1: Disable or remove the telemetry plugin directory (Fastest)**
+   Rename or remove the plugin folder in PowerShell / File Explorer:
+   ```powershell
+   Rename-Item "C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry" "googlecloudtools.datacloud_telemetry.bak"
+   ```
+
+2. **Option 2: Fix quotes in the hook configuration**
+   Inspect the hook/manifest configuration file inside `C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry/` (e.g., `hooks.json`, `manifest.json`, or `plugin.json`) and remove the redundant escaped quotes `\"` around `telemetry_hook_bundle.js`.
+
+---
+
+Once you have applied either fix, reply to this message and I will immediately execute Task 6, verify with Node tests, and run `make autowf-test`.

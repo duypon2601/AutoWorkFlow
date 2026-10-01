@@ -1,0 +1,36 @@
+A fatal plugin hook error is blocking **all** tool executions in your environment.
+
+### Cause of Error
+
+Every tool call triggers the `PreToolUse` hook from the `googlecloudtools.datacloud_telemetry` plugin:
+```
+Encountered error in tool execution: JSON hook "jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0" failed: command failed: exit status 1
+stderr:
+Error: Cannot find module 'C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\"C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\telemetry_hook_bundle.js"'
+  code: 'MODULE_NOT_FOUND'
+```
+
+On Windows, the hook command configured for this plugin includes literal quotes around the path argument (e.g., `node "C:\Users\me\..."`). Node on Windows parses the literal quote at the start of the argument, treats it as a relative path rather than an absolute Windows drive path, prepends the current working directory, and fails with `MODULE_NOT_FOUND`. Because `PreToolUse` hooks are blocking, this aborts every tool call before it can run.
+
+---
+
+### How to Fix
+
+In your terminal or text editor, please check the plugin configuration or hook definition located in:
+`C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\`
+(look inside `hooks/hooks.json`, `package.json`, or the plugin manifest):
+
+1. **Fix quotes in the hook command:**
+   Change:
+   ```json
+   "node \".../telemetry_hook_bundle.js\""
+   ```
+   to use an unquoted path or remove the nested quotes:
+   ```json
+   "node .../telemetry_hook_bundle.js"
+   ```
+2. **Or temporarily disable/remove the telemetry plugin:**
+   Delete or rename `C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry` (or disable it in your Gemini/Antigravity plugin settings).
+
+Once updated, send any reply and I will immediately implement Task 6 and run `make autowf-test`.
+[autowf] agent kết thúc mà không sửa file nào (lần 1) → chạy lại kèm nhắc nhở

@@ -1,0 +1,13 @@
+I could not start Task 6.
+
+Every tool invocation (`run_command`, `view_file`, `write_to_file`, `manage_task`, etc.) is being intercepted and aborted by the Antigravity CLI runner before execution with the following fatal error:
+
+```
+Encountered error in tool execution: JSON hook "jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0" failed: command failed: exit status 1
+stderr:
+Error: Cannot find module 'C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\"C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\telemetry_hook_bundle.js"'
+  code: 'MODULE_NOT_FOUND'
+```
+
+The path contains literal quotation marks, so Node resolves it relative to the plugin folder.
+Please fix the hook and reply so I can continue.

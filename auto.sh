@@ -135,6 +135,8 @@ AGY_CONFIG="${AGY_CONFIG:-$HOME/.gemini/config/config.json}"
 # agy -p còn nạp quyền của project mặc định này (cộng thêm vào config.json)
 AGY_CLI_PROJECT="${AGY_CLI_PROJECT:-$HOME/.gemini/config/projects/default-cli-project.json}"
 AGY_CONV_DIR="${AGY_CONV_DIR:-$HOME/.gemini/antigravity-cli/conversations}"
+# Plugin của agy (hooks.json): đổi → preflight chạy lại; plugin hỏng → lỗi ENV_HOOK
+AGY_PLUGINS_DIR="${AGY_PLUGINS_DIR:-$(dirname "$AGY_CONFIG")/plugins}"
 
 LOG_DIR=".auto-logs"
 # Thông báo hết hạn mức của Claude CLI, vd. "Claude AI usage limit reached|1727000000",
@@ -575,21 +577,39 @@ mcp_denied_target() {
   printf '%s' "$t"
 }
 
-DIAG_AUTH_RE='not logged in|login required|please (log|sign) ?in|auth method|unauthenticated|authentication (failed|required)|reauthenticate|token (has )?expired|invalid_grant'
+# Từ khoá dùng \<…\> để không khớp chuỗi con trong lời agent (vd. "quotation marks" ≠ quota).
+# ENV_HOOK: hook/plugin của agent (vd. PreToolUse của plugin trong ~/.gemini/config/plugins) hỏng → mọi công cụ bị chặn.
+DIAG_ENV_HOOK_RE='jsonhook__|\<json hook\>|\<(pre|post)tooluse\>|\<(before|after)tool hook'
+DIAG_AUTH_RE='not logged in|login required|please (log|sign) ?in|\<auth method|unauthenticated|authentication (failed|required)|reauthenticate|token (has )?expired|invalid_grant'
 DIAG_PERM_RE='auto-denied|cannot prompt|permission denied|not allowed by|denied by (policy|permission)|soft-denying'
 DIAG_MCP_RE='"mcp" permission|CallMcpTool|mcp tool|mcp\([^)<>[:space:]]+/'
-DIAG_QUOTA_RE='quota|resource.?exhausted|too many requests|(status|code|error) 429|rate.?limit|usage limit|limit reached'
-DIAG_TIMEOUT_RE='timed? ?out|deadline exceeded'
-DIAG_CRASH_RE='panic:|segmentation fault|fatal error|traceback \(most recent|core dumped|unexpected error'
+DIAG_QUOTA_RE='\<quotas?\>|resource.?exhausted|too many requests|(status|code|error):? ?429\>|\<rate.?limit(ed|s)?\>|usage limit|limit reached'
+DIAG_TIMEOUT_RE='\<timed? ?out\>|deadline exceeded'
+# "fatal error" / "panic" chỉ tính khi là output của công cụ (đầu dòng hoặc sau stderr:), không phải trong câu văn
+DIAG_CRASH_RE='^[[:space:]]*(fatal error|panic|unexpected error)\>|stderr:[[:space:]]*(fatal error|panic)\>|segmentation fault|traceback \(most recent|core dumped'
+# Dòng trông như output của công cụ (không phải lời agent): chẩn đoán trên các dòng này trước
+DIAG_TOOL_RE='^[[:space:]]*(error|stderr)\>|failed:|exit status [0-9]|MODULE_NOT_FOUND|traceback \(most recent'
+
+# diag_tool_lines <file log> → các dòng khớp DIAG_TOOL_RE và dòng ngay sau "stderr:", giữ thứ tự trong log
+diag_tool_lines() {
+  { grep -niE "$DIAG_TOOL_RE" "$1" || true; { grep -niE -A1 'stderr:' "$1" || true; } | sed -E 's/^([0-9]+)-/\1:/'; } 2>/dev/null \
+    | { grep -v '^--$' || true; } | sort -t: -k1,1n -u | cut -d: -f2-
+}
 
 # diagnose_agent_log <file log> [exit code] → in "LOẠI|dòng bằng chứng"
-# LOẠI: AUTH | PERMISSION | QUOTA | TIMEOUT | CRASH | NO_ACTION | UNKNOWN
+# LOẠI: ENV_HOOK | AUTH | PERMISSION | QUOTA | TIMEOUT | CRASH | NO_ACTION | UNKNOWN
 diagnose_agent_log() {
-  local f="$1" rc="${2:-0}" pair type re line
-  for pair in "AUTH:$DIAG_AUTH_RE" "PERMISSION:$DIAG_PERM_RE" "QUOTA:$DIAG_QUOTA_RE" "TIMEOUT:$DIAG_TIMEOUT_RE" "CRASH:$DIAG_CRASH_RE"; do
-    type="${pair%%:*}"; re="${pair#*:}"
-    line=$(grep -iE -m1 "$re" "$f" 2>/dev/null | cut -c1-240 || true)
-    if [ -n "$line" ]; then echo "$type|$line"; return 0; fi
+  local f="$1" rc="${2:-0}" pair type re line src tool
+  tool=$(diag_tool_lines "$f")
+  # Lượt 1: chỉ output công cụ; lượt 2 (không thấy gì): cả log như trước
+  for src in tool all; do
+    [ "$src" = all ] || [ -n "$tool" ] || continue
+    for pair in "ENV_HOOK:$DIAG_ENV_HOOK_RE" "AUTH:$DIAG_AUTH_RE" "PERMISSION:$DIAG_PERM_RE" "QUOTA:$DIAG_QUOTA_RE" "TIMEOUT:$DIAG_TIMEOUT_RE" "CRASH:$DIAG_CRASH_RE"; do
+      type="${pair%%:*}"; re="${pair#*:}"
+      if [ "$src" = tool ]; then line=$(printf '%s\n' "$tool" | grep -iE -m1 "$re" | cut -c1-240 || true)
+      else line=$(grep -iE -m1 "$re" "$f" 2>/dev/null | cut -c1-240 || true); fi
+      if [ -n "$line" ]; then echo "$type|$line"; return 0; fi
+    done
   done
   line=$({ grep -v '^[[:space:]]*$' "$f" 2>/dev/null || true; } | tail -n1 | cut -c1-240)
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 142 ]; then echo "TIMEOUT|exit code $rc${line:+ — $line}"
@@ -601,8 +621,29 @@ diagnose_agent_log() {
 
 # diag_advice <LOẠI> <bằng chứng> <file log> → cách xử lý cụ thể
 diag_advice() {
-  local type="$1" ev="$2" log="$3" tool cmd now at target
+  local type="$1" ev="$2" log="$3" tool cmd now at target name dir off files
   case "$type" in
+    ENV_HOOK)
+      name=$(grep -oE 'jsonhook__[A-Za-z0-9._-]+_(Pre|Post)ToolUse' "$log" 2>/dev/null | head -n1 | sed -E 's/^jsonhook__//; s/_(Pre|Post)ToolUse$//' || true)
+      # Thư mục agy thật sự nạp hook (đường dẫn đầu tiên dưới plugins/ trong log, vd. trong "Cannot find module '…'")
+      dir=$(grep -oE '[\\/]plugins[\\/][A-Za-z0-9._-]+' "$log" 2>/dev/null | head -n1 | sed -E 's/^.plugins.//' || true)
+      [ -n "$name" ] || name="${dir%%.disabled*}"
+      if [ -z "$name" ]; then
+        echo "Hook của agent hỏng nên mọi công cụ bị chặn (không xác định được plugin): xem các hooks.json trong $AGY_PLUGINS_DIR, sửa lệnh hook hỏng rồi chạy auto.sh --preflight."
+      else
+        # agy nạp plugin theo "name" trong plugin.json, kể cả thư mục đã đổi tên → phải sửa mọi bản
+        files=""
+        for off in "$AGY_PLUGINS_DIR"/*/plugin.json; do
+          grep -qF "\"$name\"" "$off" 2>/dev/null && files+="${off%/plugin.json}/hooks.json"$'\n'
+        done
+        [ -n "$files" ] || files="$AGY_PLUGINS_DIR/$name/hooks.json"$'\n'
+        echo "Hook của plugin '$name' hỏng nên mọi công cụ của agent bị chặn — lỗi môi trường, không phải lỗi của Task (chạy lại sẽ lỗi y hệt)."
+        echo "Sửa lệnh hook (trên Windows: bỏ dấu ngoặc kép thừa quanh đường dẫn file .js, dùng dấu /) trong MỌI file sau:"
+        printf '%s' "$files" | sed 's/^/  /'
+        [ -z "$dir" ] || echo "(lần này agy nạp hook từ thư mục plugins/$dir)"
+        echo "Đổi tên thư mục plugin (vd. thêm .disabled) hay đặt \"enabled\": false cho plugin trong $AGY_CONFIG KHÔNG tắt được hook: agy vẫn nạp nó (đã thử với agy 1.2.14)."
+        echo "Rồi chạy auto.sh --preflight để kiểm tra lại."
+      fi ;;
     AUTH) echo "Đăng nhập lại: mở Terminal, chạy \`$ACTIVE_CODER\` và làm theo hướng dẫn đăng nhập, rồi chạy lại auto.sh." ;;
     PERMISSION)
       tool=$(printf '%s' "$ev" | sed -nE 's/.*required the "([A-Za-z_]+)" permission.*/\1/p')
@@ -646,9 +687,19 @@ diag_advice() {
 }
 
 # ---- Preflight quyền ----
+# Plugin/hook của agy và phiên bản agy: đổi → preflight chạy lại. Gồm cả thư mục đổi tên kiểu *.disabled:
+# agy nạp plugin theo "name" trong plugin.json, không theo tên thư mục.
+agent_env_fingerprint() {
+  local f
+  if [ -d "$AGY_PLUGINS_DIR" ]; then
+    find "$AGY_PLUGINS_DIR" -type f -name '*.json' 2>/dev/null | LC_ALL=C sort \
+      | while IFS= read -r f; do echo "${f#"$AGY_PLUGINS_DIR"/}"; cat "$f"; done
+  fi
+  if [ "$CODER" = agy ] || [ "${FALLBACK_CODER:-}" = agy ]; then agy --version 2>/dev/null || true; fi
+}
 preflight_hash() {
   local h="shasum -a 256"; command -v shasum >/dev/null || h=sha256sum
-  { printf '%s\n' "$CODER" "$AGY_ALLOWED_CMDS" "$AGY_ALLOW_MCP" "${TEST_CMD:-}"; cat "$AGY_CONFIG" "$AGY_CLI_PROJECT" 2>/dev/null || true; } | $h | cut -d' ' -f1
+  { printf '%s\n' "$CODER" "$AGY_ALLOWED_CMDS" "$AGY_ALLOW_MCP" "${TEST_CMD:-}"; cat "$AGY_CONFIG" "$AGY_CLI_PROJECT" 2>/dev/null || true; agent_env_fingerprint; } | $h | cut -d' ' -f1
 }
 preflight_cached() { [ -f "$LOG_DIR/preflight.ok" ] && grep -qxF "hash=$(preflight_hash)" "$LOG_DIR/preflight.ok"; }
 
@@ -771,6 +822,18 @@ commit_task() {  # <message> <file log>
   git commit -qm "$1" --allow-empty >> "$2" 2>&1
 }
 
+# preflight_env_hook <log probe> → 0 (và ghi PREFLIGHT_REPORT) nếu probe bị hook hỏng của agent chặn
+preflight_env_hook() {
+  local ev
+  ev=$(grep -iE -m1 "$DIAG_ENV_HOOK_RE" "$1" 2>/dev/null | cut -c1-240) || return 1
+  echo "  ❌ Hook của agent hỏng — mọi công cụ bị chặn: $ev"
+  echo "  ⏭️  Bỏ qua các mục còn lại"
+  ACTIVE_CODER="$CODER"
+  PREFLIGHT_ADVICE="Cách xử lý: $(diag_advice ENV_HOOK "$ev" "$1")"
+  PREFLIGHT_REPORT="❌ Hook của agent hỏng (log: $1): $ev"$'\n'"$PREFLIGHT_ADVICE"
+  rm -f "$LOG_DIR/preflight.ok"
+}
+
 # In bảng ✅/❌; trả về 1 nếu có mục ❌ (quy tắc cần thêm để ở PREFLIGHT_REPORT)
 run_preflight() {
   local ok=1 rules="" fails="" c probe log d name exe
@@ -785,7 +848,8 @@ run_preflight() {
   else
     echo "  ❌ Đăng nhập $CODER — ${d%%|*}: ${d#*|}"
     ACTIVE_CODER="$CODER"
-    PREFLIGHT_REPORT="❌ Đăng nhập $CODER — ${d%%|*}: ${d#*|}"$'\n'"Cách xử lý: $(diag_advice "${d%%|*}" "${d#*|}" "$log")"
+    PREFLIGHT_ADVICE="Cách xử lý: $(diag_advice "${d%%|*}" "${d#*|}" "$log")"
+    PREFLIGHT_REPORT="❌ Đăng nhập $CODER — ${d%%|*}: ${d#*|}"$'\n'"$PREFLIGHT_ADVICE"
     echo "  ⏭️  Bỏ qua các mục còn lại"
     return 1
   fi
@@ -796,7 +860,8 @@ run_preflight() {
       name=$(printf '%s' "$c" | tr -c 'A-Za-z0-9_-' '_')
       log="$LOG_DIR/preflight-$name.log"
       ask_coder "Run exactly this one command and nothing else: $probe" "$log"
-      if grep -qiE "$DIAG_PERM_RE" "$log"; then
+      if preflight_env_hook "$log"; then return 1
+      elif grep -qiE "$DIAG_PERM_RE" "$log"; then
         echo "  ❌ Lệnh $c ($probe) — BỊ TỪ CHỐI"
         fails+="❌ Lệnh $c — BỊ TỪ CHỐI (log: $log)"$'\n'; rules+="$(cmd_rule "$c")"$'\n'; ok=0
       else
@@ -830,6 +895,7 @@ run_preflight() {
   if [ -f .autowf-probe.txt ]; then
     rm -f .autowf-probe.txt
     echo "  ✅ Ghi file (.autowf-probe.txt)"
+  elif preflight_env_hook "$log"; then return 1
   else
     echo "  ❌ Ghi file (.autowf-probe.txt) — agent không tạo được file"
     fails+="❌ Ghi file — agent không tạo được .autowf-probe.txt (log: $log)"$'\n'; ok=0
@@ -927,8 +993,9 @@ if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
   need "$CODER" "Cài coding agent '$CODER' trước (mặc định: Antigravity CLI agy)"
   ACTIVE_CODER="$CODER"
   load_plan || TEST_CMD=""
-  RC=0
+  RC=0; PREFLIGHT_ADVICE=""
   run_preflight || RC=5
+  [ -z "$PREFLIGHT_ADVICE" ] || printf '%s\n' "$PREFLIGHT_ADVICE" | sed 's/^/   /'
   echo "🔎 Git hook (log: $LOG_DIR/preflight-hooks.log)"
   check_commit_hooks || RC=5
   exit "$RC"
@@ -1278,6 +1345,22 @@ Cách xử lý: nếu lệnh đó thật sự cần, thêm vào AGY_ALLOWED_CMDS
       T_END[N]=$(date +%s)
       DIAG=$(diagnose_agent_log "$CODE_LOG" "$CODER_RC")
       DIAG_TYPE="${DIAG%%|*}"; DIAG_EV="${DIAG#*|}"
+      # Đuôi log thường là lời agent giải thích vì sao bị chặn — đưa vào bằng chứng
+      DIAG_TAIL=""
+      if [ "$DIAG_TYPE" = NO_ACTION ] || [ "$DIAG_TYPE" = ENV_HOOK ]; then
+        DIAG_TAIL=$({ grep -v -e '^[[:space:]]*$' -e '^\[auto\.sh\]' "$CODE_LOG" 2>/dev/null || true; } | tail -n 15 | cut -c1-240 | sed 's/^/  │ /')
+        DIAG_TAIL=$'\n'"Cuối log:"$'\n'"$DIAG_TAIL"
+      fi
+      # Hook/plugin của agent hỏng: lỗi môi trường, chạy lại cũng y hệt → dừng ngay, không tính lượt thử của Task
+      if [ "$DIAG_TYPE" = ENV_HOOK ]; then
+        T_TRIES[N]=$((TRY - 1))
+        rm -f "$LOG_DIR/preflight.ok"
+        stop 2 "Cầu dao: lỗi môi trường ở Task $N — hook của agent hỏng chặn mọi công cụ (không tính lượt thử)" \
+          "Loại lỗi: ENV_HOOK
+Bằng chứng: $DIAG_EV$DIAG_TAIL
+Log: $CODE_LOG (exit code $CODER_RC)
+Cách xử lý: $(diag_advice ENV_HOOK "$DIAG_EV" "$CODE_LOG")"
+      fi
       # Agent thoát bình thường mà chưa làm gì (vd. chạy TEST_CMD nền rồi kết thúc lượt "sẽ chờ"):
       # thường chỉ xảy ra một lần → chạy lại kèm nhắc nhở; lặp lại liên tiếp mới dừng.
       IDLE_STREAK=$((IDLE_STREAK + 1))
@@ -1289,7 +1372,7 @@ Cách xử lý: nếu lệnh đó thật sự cần, thêm vào AGY_ALLOWED_CMDS
       fi
       stop 2 "Cầu dao: agent không thay đổi file nào ở Task $N (lần $TRY) — lỗi $DIAG_TYPE" \
         "Loại lỗi: $DIAG_TYPE
-Bằng chứng: ${DIAG_EV:-(log trống)}
+Bằng chứng: ${DIAG_EV:-(log trống)}$DIAG_TAIL
 Log: $CODE_LOG (exit code $CODER_RC)
 Cách xử lý: $(diag_advice "$DIAG_TYPE" "$DIAG_EV" "$CODE_LOG")"
     fi

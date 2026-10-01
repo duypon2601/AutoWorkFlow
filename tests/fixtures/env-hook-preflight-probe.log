@@ -1,0 +1,38 @@
+An attempt was made to run `.venv/bin/python --version`, but execution was blocked by a broken system hook in your Antigravity configuration.
+
+### Error Details
+
+The tool harness executes a `PreToolUse` hook before every tool call:
+
+```text
+JSON hook "jsonhook__googlecloudtools.datacloud_telemetry_PreToolUse_0_0" failed: command failed: exit status 1
+stderr:
+Error: Cannot find module 'C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\"C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\telemetry_hook_bundle.js"'
+  code: 'MODULE_NOT_FOUND'
+```
+
+### Cause
+
+In the plugin configuration for `googlecloudtools.datacloud_telemetry`, the script path contains literal quotes:
+```
+"C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\telemetry_hook_bundle.js"
+```
+When Node.js / the CLI resolves this relative to the plugin directory, it constructs the invalid path:
+```
+C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\"C:\Users\me\...
+```
+Because the `PreToolUse` hook fails with exit code 1, the agent harness aborts all tool execution.
+
+### How to Fix
+
+1. Open the plugin/hook configuration in:
+   ```
+   C:\Users\me\.gemini\config\plugins\googlecloudtools.datacloud_telemetry\
+   ```
+   (look for `plugin.json`, `hooks.json`, or manifest settings).
+2. Fix the path to `telemetry_hook_bundle.js`:
+   - Remove the embedded quotation marks `"` around the path, or
+   - Change it to a relative path: `telemetry_hook_bundle.js`
+3. Alternatively, temporarily remove or rename the `googlecloudtools.datacloud_telemetry` directory under `C:\Users\me\.gemini\config\plugins\`.
+
+*(Note: On Windows PowerShell, once tools can run, the command will also need to reference `.venv\Scripts\python.exe` if this is a standard Windows virtual environment).*
