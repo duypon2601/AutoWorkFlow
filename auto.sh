@@ -1,8 +1,8 @@
 #!/bin/bash
-# auto.sh — Claude lên plan & review, coding agent (mặc định Antigravity CLI `agy`) viết code.
+# auto.sh — Claude hoặc Codex lên plan & review, coding agent (mặc định Antigravity CLI `agy`) viết code.
 #
 # Cách dùng:
-#   ./auto.sh "mô tả dự án"   chưa có PLAN.md: Claude viết plan rồi chạy
+#   ./auto.sh "mô tả dự án"   chưa có PLAN.md: reviewer viết plan rồi chạy
 #   ./auto.sh                 đã có PLAN.md: chạy (hoặc chạy tiếp) theo plan
 #   ./auto.sh --check         chỉ kiểm tra công cụ, PLAN.md, git và git hook rồi thoát
 #   ./auto.sh --new-branch    ép tạo branch auto/* mới thay vì làm tiếp branch auto/* hiện tại
@@ -16,8 +16,12 @@
 # Biến cấu hình: đặt trong .autowf.env ở gốc repo, hoặc qua env (env được ưu tiên hơn file):
 #   CODER=agy              coding agent: agy | gemini | ...
 #   FALLBACK_CODER=        agent dự phòng khi CODER lỗi đăng nhập/quyền (ví dụ: gemini)
-#   PLAN_MODEL=opus        model Claude viết PLAN.md
-#   REVIEW_MODEL=sonnet    model Claude review
+#   REVIEWER=auto          ai viết plan & review: claude | codex | auto (chỉ cài một trong hai CLI thì dùng cái đó;
+#                          cài cả hai thì claude). Codex CLI: `codex` trong PATH hoặc bản đi kèm ChatGPT.app
+#   PLAN_MODEL=            model viết PLAN.md (mặc định: claude → opus; codex → gpt-6-astra)
+#   REVIEW_MODEL=          model review (mặc định: claude → sonnet; codex → gpt-6.1-sol)
+#   PLAN_EFFORT=high       mức suy luận của Codex khi viết plan (low | medium | high | xhigh | max | ultra); chỉ dùng
+#   REVIEW_EFFORT=medium   với REVIEWER=codex, thay cho model_reasoning_effort trong ~/.codex/config.toml
 #   MAX_TRIES=3            số vòng sửa tối đa mỗi task
 #   MAX_EXTRA_TRIES=2      số vòng thêm tối đa sau MAX_TRIES, chỉ khi vòng cuối còn tiến triển (reviewer báo
 #                          đã sửa được điểm cũ và số lỗi chặn giảm, hoặc chỉ còn hook từ chối commit)
@@ -26,7 +30,7 @@
 #   REQUIRE_CMD=           lệnh kiểm tra dịch vụ ngoài TEST_CMD cần (vd. "docker compose exec -T postgres pg_isready");
 #                          chạy trước mỗi lần thử và khi test fail; lỗi thì chờ dịch vụ, không tính là lần thử
 #   REQUIRE_WAIT_MINS=30   thời gian tối đa chờ dịch vụ trong REQUIRE_CMD sẵn sàng, quá thì dừng (exit 6)
-#   MAX_WAIT_HOURS=6       tổng thời gian tối đa chờ khi Claude hoặc coding agent chạm giới hạn sử dụng
+#   MAX_WAIT_HOURS=6       tổng thời gian tối đa chờ khi reviewer hoặc coding agent chạm giới hạn sử dụng
 #   DIFF_LIMIT=120000      số byte diff tối đa gửi cho reviewer; vượt thì ghi rõ file nào bị cắt để reviewer tự đọc
 #   AGY_ALLOWED_CMDS=...   danh sách lệnh nhắc agy dùng (phải khớp allowlist trong ~/.gemini/config/config.json)
 #   AGY_ALLOW_MCP=         MCP tool agy được dùng, dạng "server/tool" (ví dụ "flutter_dart-mcp-server/dtd");
@@ -37,6 +41,7 @@
 #                          ghi thêm vào .auto-logs/task<N>-try<M>-code.log.steps (0 = tắt; cần Python có sqlite3)
 # Ví dụ:
 #   REVIEW_MODEL=haiku ./auto.sh
+#   REVIEWER=codex ./auto.sh
 #   CODER=gemini ./auto.sh
 #   FALLBACK_CODER=gemini MAX_TRIES=5 ./auto.sh
 #
@@ -107,7 +112,7 @@ if [ -d .venv/bin ] && [ -z "${VIRTUAL_ENV:-}" ]; then
 fi
 
 # ---- Cấu hình: mặc định < .autowf.env < biến môi trường ----
-CONFIG_VARS="NTFY_TOPIC NTFY_SERVER CODER FALLBACK_CODER PLAN_MODEL REVIEW_MODEL MAX_TRIES MAX_EXTRA_TRIES MAX_WAIT_HOURS DIFF_LIMIT AGY_ALLOWED_CMDS AGY_ALLOW_MCP REQUIRE_CMD REQUIRE_WAIT_MINS AGY_TOKEN_WARN"
+CONFIG_VARS="NTFY_TOPIC NTFY_SERVER CODER FALLBACK_CODER REVIEWER PLAN_MODEL REVIEW_MODEL PLAN_EFFORT REVIEW_EFFORT MAX_TRIES MAX_EXTRA_TRIES MAX_WAIT_HOURS DIFF_LIMIT AGY_ALLOWED_CMDS AGY_ALLOW_MCP REQUIRE_CMD REQUIRE_WAIT_MINS AGY_TOKEN_WARN"
 if [ -f .autowf.env ]; then
   ENV_OVERRIDES=""
   for v in $CONFIG_VARS; do
@@ -119,8 +124,41 @@ if [ -f .autowf.env ]; then
 fi
 CODER="${CODER:-agy}"
 FALLBACK_CODER="${FALLBACK_CODER:-}"
-PLAN_MODEL="${PLAN_MODEL:-opus}"
-REVIEW_MODEL="${REVIEW_MODEL:-sonnet}"
+REVIEWER="${REVIEWER:-auto}"
+# Codex CLI: trong PATH, hoặc bản đi kèm ChatGPT.app (app không tự thêm nó vào PATH)
+CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
+if [ -z "$CODEX_BIN" ] && [ -x /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex ]; then
+  CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex
+fi
+case "$REVIEWER" in
+  auto) if ! command -v claude >/dev/null && [ -n "$CODEX_BIN" ]; then REVIEWER=codex; else REVIEWER=claude; fi ;;
+  claude|codex) ;;
+  *) echo "❌ REVIEWER='$REVIEWER' không hợp lệ (auto | claude | codex)"; exit 1 ;;
+esac
+if [ "$REVIEWER" = codex ]; then
+  REVIEWER_NAME=Codex; REVIEWER_BIN="${CODEX_BIN:-codex}"
+  REVIEWER_HINT="Cài Codex CLI (npm i -g @openai/codex) hoặc ChatGPT.app, rồi chạy 'codex login'"
+  # Mặc định như cặp opus/sonnet của Claude: model mạnh nhất viết plan (một lần), model "workhorse" review (mỗi vòng).
+  # Thử trên diff cài sẵn 2 lỗi: gpt-6.1-sol medium bắt đủ cả 2 trong ~15s; high/ultra không bắt thêm gì mà lâu
+  # gấp 3 / tốn token gấp 4; gpt-6-luna sót 1 lỗi.
+  # Model mặc định không còn trong danh sách của tài khoản → để rỗng = Codex dùng model trong ~/.codex/config.toml.
+  codex_default_model() {
+    local cache="${CODEX_HOME:-$HOME/.codex}/models_cache.json"
+    if [ -f "$cache" ] && ! grep -qE "\"slug\": *\"$1\"" "$cache"; then
+      echo "⚠️  Codex không còn model '$1' — dùng model trong ~/.codex/config.toml (đặt $2 để chọn model khác)" >&2
+    else
+      echo "$1"
+    fi
+  }
+  [ -n "${PLAN_MODEL+x}" ] || PLAN_MODEL=$(codex_default_model gpt-6-astra PLAN_MODEL)
+  [ -n "${REVIEW_MODEL+x}" ] || REVIEW_MODEL=$(codex_default_model gpt-6.1-sol REVIEW_MODEL)
+  PLAN_EFFORT="${PLAN_EFFORT:-high}"; REVIEW_EFFORT="${REVIEW_EFFORT:-medium}"
+else
+  REVIEWER_NAME=Claude; REVIEWER_BIN=claude
+  REVIEWER_HINT="Cài: curl -fsSL https://claude.ai/install.sh | bash"
+  PLAN_MODEL="${PLAN_MODEL:-opus}"; REVIEW_MODEL="${REVIEW_MODEL:-sonnet}"
+  PLAN_EFFORT=""; REVIEW_EFFORT=""
+fi
 MAX_TRIES="${MAX_TRIES:-3}"
 MAX_EXTRA_TRIES="${MAX_EXTRA_TRIES:-2}"
 MAX_WAIT_HOURS="${MAX_WAIT_HOURS:-6}"
@@ -149,7 +187,7 @@ AGY_CONV_DIR="${AGY_CONV_DIR:-$HOME/.gemini/antigravity-cli/conversations}"
 AGY_PLUGINS_DIR="${AGY_PLUGINS_DIR:-$(dirname "$AGY_CONFIG")/plugins}"
 
 LOG_DIR=".auto-logs"
-# Thông báo hết hạn mức của Claude CLI, vd. "Claude AI usage limit reached|1727000000",
+# Thông báo hết hạn mức của Claude CLI / Codex CLI, vd. "Claude AI usage limit reached|1727000000",
 # "5-hour limit reached ∙ resets 3pm", "You've hit your limit · resets 5pm". Không dùng "rate limit"/"resets"
 # trần: review về code rate limiter cũng chứa các chữ đó.
 LIMIT_RE='usage limit|limit reached|hit your (usage )?limit|rate limit (reached|exceeded)|resets (at |in )?[0-9]'
@@ -1059,7 +1097,7 @@ fi
 # ---- --check ----
 if [ "$CHECK_ONLY" -eq 1 ]; then
   OK=1
-  for c in claude "$CODER" ${FALLBACK_CODER:+"$FALLBACK_CODER"}; do
+  for c in "$REVIEWER_BIN" "$CODER" ${FALLBACK_CODER:+"$FALLBACK_CODER"}; do
     if command -v "$c" >/dev/null; then echo "✅ Đã cài $c"; else echo "❌ Chưa cài $c"; OK=0; fi
   done
   if load_plan; then echo "✅ PLAN.md hợp lệ: $TOTAL task, TEST_CMD: $TEST_CMD"
@@ -1139,7 +1177,7 @@ if [ -n "$ADOPT" ]; then
   exit 0
 fi
 
-need claude "Cài: curl -fsSL https://claude.ai/install.sh | bash"
+need "$REVIEWER_BIN" "$REVIEWER_HINT"
 need "$CODER" "Cài coding agent '$CODER' trước (mặc định: Antigravity CLI agy)"
 if [ -n "$FALLBACK_CODER" ] && ! command -v "$FALLBACK_CODER" >/dev/null; then
   echo "⚠️  FALLBACK_CODER='$FALLBACK_CODER' chưa cài — sẽ không có agent dự phòng"
@@ -1221,8 +1259,8 @@ write_summary() {
     echo
     echo "- Bắt đầu: $(fmt_time "$RUN_START"), tổng thời gian: $(fmt_dur $(($(date +%s) - RUN_START)))"
     echo "- Branch: $BRANCH"
-    echo "- Coding agent: $CODER${FALLBACK_NOTE:+ — $FALLBACK_NOTE}; review: $REVIEW_MODEL"
-    echo "- Số lần chờ hạn mức (Claude/agent): $WAIT_COUNT (tổng $(fmt_dur "$WAITED_SECS"))"
+    echo "- Coding agent: $CODER${FALLBACK_NOTE:+ — $FALLBACK_NOTE}; review: $REVIEWER_NAME (${REVIEW_MODEL:-model mặc định}${REVIEW_EFFORT:+, $REVIEW_EFFORT})"
+    echo "- Số lần chờ hạn mức (reviewer/agent): $WAIT_COUNT (tổng $(fmt_dur "$WAITED_SECS"))"
     echo "- Kết thúc: $STOP_REASON"
     if [ "$rc" -ne 0 ]; then
       echo
@@ -1273,21 +1311,45 @@ stop() {  # stop <exit code> <lý do> [chi tiết nhiều dòng]
   exit "$1"
 }
 
-# ---- Claude: tự chờ khi chạm giới hạn sử dụng ----
+# ---- Reviewer (Claude / Codex): tự chờ khi chạm giới hạn sử dụng ----
 is_usage_limit() {  # <file output> <exit code>
   # Thông báo hạn mức chỉ 1–2 dòng; output dài hơn là câu trả lời thật (dù có nhắc tới "limit")
   [ "$(grep -c . "$1" 2>/dev/null || true)" -le 3 ] || return 1
   grep -qiE "$LIMIT_RE" "$1"
 }
 
-# claude_call <file stdin> <file output> <tham số cho claude...>
+# reviewer_run <file stdin> <file output> <plan|review> <prompt> — gọi REVIEWER đúng một lần.
+# plan: được ghi file trong repo (viết PLAN.md); review: chỉ đọc.
+reviewer_run() {
+  local in="$1" out="$2" mode="$3" prompt="$4" model effort sandbox
+  if [ "$REVIEWER" = codex ]; then
+    if [ "$mode" = plan ]; then model="$PLAN_MODEL"; effort="$PLAN_EFFORT"; sandbox=workspace-write
+    else model="$REVIEW_MODEL"; effort="$REVIEW_EFFORT"; sandbox=read-only; fi
+    # codex exec in cả phiên (kèm lại prompt) ra màn hình → câu trả lời cuối lấy qua -o, phần còn lại vào <out>.log
+    : > "$out"
+    { cat "$in"; printf '\n%s\n' "$prompt"; } \
+      | "$REVIEWER_BIN" exec ${model:+--model "$model"} -c "model_reasoning_effort=\"$effort\"" --sandbox "$sandbox" --color never -o "$out" - > "$out.log" 2>&1 || return $?
+    return 0
+  fi
+  if [ "$mode" = plan ]; then
+    claude -p "$prompt" --model "$PLAN_MODEL" --permission-mode acceptEdits --allowedTools "Read,Write,Glob,Grep" < "$in" > "$out" 2>&1
+  else
+    claude -p --model "$REVIEW_MODEL" "$prompt" < "$in" > "$out" 2>&1
+  fi
+}
+
+# reviewer_call <file stdin> <file output> <plan|review> <prompt>
 # Chạm giới hạn sử dụng thì ngủ tới giờ reset rồi thử lại; không tính là một lần FAIL của task.
-claude_call() {
+reviewer_call() {
   local in="$1" out="$2" rc now reset_at wait_s msg
-  shift 2
   while true; do
     rc=0
-    claude "$@" < "$in" > "$out" 2>&1 || rc=$?
+    reviewer_run "$@" || rc=$?
+    # Codex không trả lời (hết hạn mức, chưa đăng nhập...): lỗi nằm ở cuối log phiên. Chỉ lấy vài dòng cuối —
+    # phần trên của log chép lại cả prompt/diff, có thể chứa chữ "limit".
+    if [ "$REVIEWER" = codex ] && [ ! -s "$out" ]; then
+      tail -n 5 "$out.log" 2>/dev/null | { grep -iE "error|$LIMIT_RE" || true; } | tail -n 3 > "$out"
+    fi
     is_usage_limit "$out" "$rc" || return "$rc"
 
     now=$(date +%s)
@@ -1300,13 +1362,13 @@ claude_call() {
       msg="$msg — TEST: chỉ chờ ${AUTOWF_TEST_WAIT_SECS}s"; wait_s="$AUTOWF_TEST_WAIT_SECS"
     fi
     if [ $((WAITED_SECS + wait_s)) -gt $((MAX_WAIT_HOURS * 3600)) ]; then
-      stop 3 "Claude chạm giới hạn sử dụng; chờ thêm sẽ vượt MAX_WAIT_HOURS=${MAX_WAIT_HOURS}h ($msg)"
+      stop 3 "$REVIEWER_NAME chạm giới hạn sử dụng; chờ thêm sẽ vượt MAX_WAIT_HOURS=${MAX_WAIT_HOURS}h ($msg)"
     fi
     WAIT_COUNT=$((WAIT_COUNT + 1)); WAITED_SECS=$((WAITED_SECS + wait_s))
-    echo "⏳ Claude chạm giới hạn sử dụng ($msg). Sẽ chạy lại lúc $(fmt_time $((now + wait_s)))."
-    notify "Claude hết hạn mức, chạy lại lúc $(fmt_time $((now + wait_s)))"
+    echo "⏳ $REVIEWER_NAME chạm giới hạn sử dụng ($msg). Sẽ chạy lại lúc $(fmt_time $((now + wait_s)))."
+    notify "$REVIEWER_NAME hết hạn mức, chạy lại lúc $(fmt_time $((now + wait_s)))"
     sleep "$wait_s"
-    echo "▶️  Hết giờ chờ — gọi lại Claude"
+    echo "▶️  Hết giờ chờ — gọi lại $REVIEWER_NAME"
   done
 }
 
@@ -1336,10 +1398,10 @@ test_signature() {
     -e 's/(line |:)[0-9]+/\1N/g' -e 's/0x[0-9a-fA-F]+/0xN/g' -e 's/ in [0-9.]+s/ in Ns/g'
 }
 
-# ---- Bước 1: Claude viết plan ----
+# ---- Bước 1: reviewer viết plan ----
 if [ ! -f PLAN.md ]; then
-  echo "🧠 Claude ($PLAN_MODEL) đang viết PLAN.md..."
-  claude_call /dev/null "$LOG_DIR/plan.log" -p "Write a PLAN.md file for the following project: $DESC
+  echo "🧠 $REVIEWER_NAME (${PLAN_MODEL:-model mặc định}${PLAN_EFFORT:+, $PLAN_EFFORT}) đang viết PLAN.md..."
+  reviewer_call /dev/null "$LOG_DIR/plan.log" plan "Write a PLAN.md file for the following project: $DESC
 
 MANDATORY format:
 - Write the whole plan in English.
@@ -1350,9 +1412,8 @@ MANDATORY format:
 - Keep tasks small (few files, one concern): the coding agent's token cost grows with every file it reads and every step it takes.
 - Make TEST_CMD print compact output (e.g. pytest -q, vitest --reporter=dot, go test without -v): the agent reads that output on every run.
 - Task 1 sets up the project skeleton and test configuration so TEST_CMD runs.
-- Write it so another coding agent can follow it without asking questions." \
-    --model "$PLAN_MODEL" --permission-mode acceptEdits --allowedTools "Read,Write,Glob,Grep" || true
-  [ -f PLAN.md ] || stop 1 "Claude không tạo được PLAN.md, xem $LOG_DIR/plan.log" "$(tail -n 5 "$LOG_DIR/plan.log" 2>/dev/null || true)"
+- Write it so another coding agent can follow it without asking questions." || true
+  [ -f PLAN.md ] || stop 1 "$REVIEWER_NAME không tạo được PLAN.md, xem $LOG_DIR/plan.log" "$(tail -n 5 "$LOG_DIR/plan.log" 2>/dev/null || true)"
   git add -A && git commit -qm "PLAN.md"
 fi
 
@@ -1536,7 +1597,7 @@ Log: $LOG_DIR/task$N-try$TRY-test.log (lần trước: $LOG_DIR/task$N-try$((TRY
       echo; echo "=== GIT DIFF FOR TASK $N ==="; [ -z "$DIFF_NOTE" ] || echo "$DIFF_NOTE"; echo "$DIFF"
     } > "$REVIEW_IN"
 
-    echo "🔍 Claude ($REVIEW_MODEL) đang review..."
+    echo "🔍 $REVIEWER_NAME (${REVIEW_MODEL:-model mặc định}${REVIEW_EFFORT:+, $REVIEW_EFFORT}) đang review..."
     REVIEW_PROMPT="You are a strict code reviewer. Review Task $N against its acceptance criteria in the PLAN.md excerpt above, using the test results and the diff. Check for bugs, security issues, edge cases and deviations from the plan.
 PLAN.md is fixed and approved: never ask the coder to edit PLAN.md; judge the code against it. If the diff is marked TRUNCATED, read the files listed as not shown from the working tree before judging, and never FAIL only because a file is missing from the truncated diff.
 If a PREVIOUS REVIEW section is present, first check every item in it: FAIL if any is still not fixed. Then write one line 'PROGRESS: <fixed>/<total>' = how many of its items are now fixed. For a problem it did not raise, FAIL only if it is a real bug, a security issue or a failing test; anything else is a nit.
@@ -1544,17 +1605,16 @@ If passing would need a decision PLAN.md does not make (behaviour, scope or requ
 Answer BRIEFLY, in English. The FIRST line must be exactly one word: PASS or FAIL — and write that word on no other line.
 If FAIL: at most 10 checklist items, ONE line each, formatted '- file:location — problem — fix' (or '- plan-gap: ...').
 If PASS: you may add up to 5 non-blocking suggestions, ONE line each, formatted '- nit: file:location — suggestion'. Do not paste long code."
-    REVIEW_ARGS=(-p --model "$REVIEW_MODEL" "$REVIEW_PROMPT")
-    claude_call "$REVIEW_IN" "$REVIEW_OUT" "${REVIEW_ARGS[@]}" \
-      || { T_END[N]=$(date +%s); stop 4 "Không gọi được Claude để review Task $N, xem $REVIEW_OUT" "$(head -n 5 "$REVIEW_OUT" 2>/dev/null || true)"; }
+    reviewer_call "$REVIEW_IN" "$REVIEW_OUT" review "$REVIEW_PROMPT" \
+      || { T_END[N]=$(date +%s); stop 4 "Không gọi được $REVIEWER_NAME để review Task $N, xem $REVIEW_OUT" "$(head -n 5 "$REVIEW_OUT" 2>/dev/null || true)"; }
 
     VERDICT=$(cat "$REVIEW_OUT")
     FIRST=$(parse_verdict "$VERDICT")
     if [ "$FIRST" = NONE ]; then
       echo "⚠️  Review Task $N không có dòng PASS/FAIL riêng — gọi review lại một lần"
       mv "$REVIEW_OUT" "$REVIEW_OUT.no-verdict"
-      claude_call "$REVIEW_IN" "$REVIEW_OUT" "${REVIEW_ARGS[@]}" \
-        || { T_END[N]=$(date +%s); stop 4 "Không gọi được Claude để review Task $N, xem $REVIEW_OUT" "$(head -n 5 "$REVIEW_OUT" 2>/dev/null || true)"; }
+      reviewer_call "$REVIEW_IN" "$REVIEW_OUT" review "$REVIEW_PROMPT" \
+        || { T_END[N]=$(date +%s); stop 4 "Không gọi được $REVIEWER_NAME để review Task $N, xem $REVIEW_OUT" "$(head -n 5 "$REVIEW_OUT" 2>/dev/null || true)"; }
       VERDICT=$(cat "$REVIEW_OUT")
       FIRST=$(parse_verdict "$VERDICT")
       if [ "$FIRST" = NONE ]; then echo "⚠️  Review lại vẫn không có PASS/FAIL — tính là FAIL"; FIRST=FAIL; fi
