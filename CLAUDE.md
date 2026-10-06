@@ -7,7 +7,7 @@ code, and the script runs `TEST_CMD` and commits each passing task on an `auto/*
 
 ## Tech Stack
 - `auto.sh`: bash (macOS system bash, `set -euo pipefail`), plus awk/sed/git; Python with
-  `sqlite3` only for `AGY_WATCH`. No shellcheck installed.
+  `sqlite3` only for `AGY_WATCH`. Linted with shellcheck, secrets scanned with gitleaks.
 - `todo/`: Python >= 3.10, standard library only. Dev dependency: `pytest`.
 
 ## Commands
@@ -17,7 +17,13 @@ code, and the script runs `TEST_CMD` and commits each passing task on an `auto/*
 - Tool/plan/hook check only: `./auto.sh --check`
 - Usage and every config variable: `./auto.sh --help` (prints the header comment of `auto.sh`)
 
-Run all three test commands before calling a change to `auto.sh` done.
+- Quality checks: `make check-fast` (after an edit), `make check-task` (task done),
+  `make check-full` (before review or push)
+
+Read `CONSTRAINTS.md` before writing code. Do not weaken it to make a change pass. A failing
+check does not stop the task: report it in the hand-back and carry on.
+
+Run `make check-task` before calling a change to `auto.sh` done.
 
 ## Project Map
 - `auto.sh` — the whole pipeline, one file. The header comment is the user-facing docs
