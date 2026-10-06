@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test hồi quy cho phần chẩn đoán log agent của auto.sh (diagnose_agent_log, diag_advice ENV_HOOK,
-# agent_env_fingerprint). Chạy: bash tests/diagnose_test.sh — exit ≠ 0 nếu có mục sai.
+# agent_env_fingerprint) và câu nhắc skill cho agy (agy_skills_rule). Chạy: bash tests/diagnose_test.sh — exit ≠ 0 nếu có mục sai.
 # Fixture env-hook-*/permission-* là log thật (đổi tên user); quota/crash/prose là log dựng tay.
 set -uo pipefail
 
@@ -13,7 +13,8 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 # auto.sh dùng CRLF → bỏ \r trước.
 tr -d '\r' < "$AUTO" | awk '
   /^DIAG_[A-Z_]+=/ { print; next }
-  /^(diag_tool_lines|diagnose_agent_log|diag_advice|agent_env_fingerprint)\(\) \{/ { infn = 1 }
+  /^skill_items\(\) \{.*\}$/ { print; next }
+  /^(diag_tool_lines|diagnose_agent_log|diag_advice|agent_env_fingerprint|agy_skills_rule)\(\) \{/ { infn = 1 }
   infn { print; if ($0 ~ /^}/) infn = 0 }
 ' > "$TMP/lib.sh"
 # shellcheck source=/dev/null
@@ -72,6 +73,19 @@ fp4=$(agent_env_fingerprint)
 [ "$fp1" != "$fp2" ] && ok "đổi hooks.json → đổi fingerprint" || bad "đổi hooks.json không đổi fingerprint"
 [ "$fp2" != "$fp3" ] && ok "đổi hooks.json trong thư mục *.disabled (agy vẫn nạp) → đổi fingerprint" || bad "bỏ sót thư mục *.disabled"
 [ "$fp3" != "$fp4" ] && ok "đổi tên thư mục plugin → đổi fingerprint" || bad "đổi tên thư mục plugin không đổi fingerprint"
+
+echo "agy_skills_rule"
+if [ -z "$(AGY_SKILLS="" agy_skills_rule)" ]; then ok "AGY_SKILLS rỗng → không thêm gì vào prompt"
+else bad "AGY_SKILLS rỗng mà vẫn thêm vào prompt"; fi
+out=$(AGY_SKILLS="test-driven-development, debugging-and-error-recovery" agy_skills_rule)
+case "$out" in
+  *"/agent-skills:test-driven-development, /agent-skills:debugging-and-error-recovery."*) ok "liệt kê đủ skill, tách bằng phẩy hoặc dấu cách" ;;
+  *) bad "thiếu skill trong câu nhắc: $out" ;;
+esac
+case "$out" in
+  *"do not run git commit"*) ok "nhắc luật lệnh vẫn thắng skill (không commit)" ;;
+  *) bad "không nhắc cấm commit: $out" ;;
+esac
 
 echo "Kết quả: $pass đạt, $fail sai"
 [ "$fail" -eq 0 ]

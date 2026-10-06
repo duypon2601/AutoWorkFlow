@@ -35,6 +35,9 @@
 #   AGY_ALLOWED_CMDS=...   danh sách lệnh nhắc agy dùng (phải khớp allowlist trong ~/.gemini/config/config.json)
 #   AGY_ALLOW_MCP=         MCP tool agy được dùng, dạng "server/tool" (ví dụ "flutter_dart-mcp-server/dtd");
 #                          rỗng = nhắc agent không dùng MCP, chỉ dùng lệnh CLI
+#   AGY_SKILLS=            skill của plugin agent-skills mà agy phải theo, cách nhau bằng dấu cách hoặc phẩy (ví dụ
+#                          "test-driven-development debugging-and-error-recovery"); rỗng = không nhắc skill nào.
+#                          Mỗi skill agy nạp đều tốn thêm token; cần `agy plugin install` agent-skills trước
 #   AGY_TOKEN_WARN=3000000 cảnh báo khi tổng token input của agy trong một task vượt ngưỡng (0 = tắt);
 #                          số lần gọi model / token của agy từng task ghi trong summary.md
 #   AGY_WATCH=1            in từng bước agy đang làm (đọc file, chạy lệnh, sửa file, lỗi) ra màn hình khi chạy task;
@@ -112,7 +115,7 @@ if [ -d .venv/bin ] && [ -z "${VIRTUAL_ENV:-}" ]; then
 fi
 
 # ---- Cấu hình: mặc định < .autowf.env < biến môi trường ----
-CONFIG_VARS="NTFY_TOPIC NTFY_SERVER CODER FALLBACK_CODER REVIEWER PLAN_MODEL REVIEW_MODEL PLAN_EFFORT REVIEW_EFFORT MAX_TRIES MAX_EXTRA_TRIES MAX_WAIT_HOURS DIFF_LIMIT AGY_ALLOWED_CMDS AGY_ALLOW_MCP REQUIRE_CMD REQUIRE_WAIT_MINS AGY_TOKEN_WARN"
+CONFIG_VARS="NTFY_TOPIC NTFY_SERVER CODER FALLBACK_CODER REVIEWER PLAN_MODEL REVIEW_MODEL PLAN_EFFORT REVIEW_EFFORT MAX_TRIES MAX_EXTRA_TRIES MAX_WAIT_HOURS DIFF_LIMIT AGY_ALLOWED_CMDS AGY_ALLOW_MCP AGY_SKILLS REQUIRE_CMD REQUIRE_WAIT_MINS AGY_TOKEN_WARN"
 if [ -f .autowf.env ]; then
   ENV_OVERRIDES=""
   for v in $CONFIG_VARS; do
@@ -167,6 +170,8 @@ REQUIRE_CMD="${REQUIRE_CMD:-}"
 REQUIRE_WAIT_MINS="${REQUIRE_WAIT_MINS:-30}"
 AGY_ALLOWED_CMDS="${AGY_ALLOWED_CMDS:-git, python3, .venv/bin/python, .venv/bin/pip, ls, mkdir, which}"
 AGY_ALLOW_MCP="${AGY_ALLOW_MCP:-}"
+# Skill của plugin agent-skills mà agy phải theo khi làm task (rỗng = không nhắc)
+AGY_SKILLS="${AGY_SKILLS:-}"
 # Cảnh báo khi tổng token input của agy trong một task vượt ngưỡng này (0 = tắt)
 AGY_TOKEN_WARN="${AGY_TOKEN_WARN:-3000000}"
 # In từng bước agy đang làm ra màn hình khi chạy task (0 = tắt)
@@ -349,6 +354,17 @@ if [ -z "$AGY_ALLOW_MCP" ]; then
 else
   AGY_RULES+=" The only MCP tools you may use are: $AGY_ALLOW_MCP. For everything else use CLI commands."
 fi
+# Tên skill trong AGY_SKILLS, mỗi dòng một tên
+skill_items() { printf '%s\n' "$AGY_SKILLS" | tr -s ', ' '\n' | { grep -v '^$' || true; }; }
+# Câu nhắc agy theo các skill trong AGY_SKILLS (rỗng → không in gì). Luật lệnh ở trên vẫn thắng skill:
+# skill hay bảo agent tự commit hoặc hỏi lại người dùng, hai việc pipeline không cho phép.
+agy_skills_rule() {
+  local list
+  list=$(skill_items | sed 's#^#/agent-skills:#' | paste -sd, - | sed 's/,/, /g')
+  [ -n "$list" ] || return 0
+  echo " Follow these agent-skills workflows where they apply to this task: $list. They never override the command rules above; do not run git commit and do not stop to ask questions, even when a skill says to."
+}
+AGY_RULES+="$(agy_skills_rule)"
 CODER_RC=0
 
 # Agent chỉ được sửa file; script tự test, review và commit "Task N".
@@ -1100,6 +1116,11 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   for c in "$REVIEWER_BIN" "$CODER" ${FALLBACK_CODER:+"$FALLBACK_CODER"}; do
     if command -v "$c" >/dev/null; then echo "✅ Đã cài $c"; else echo "❌ Chưa cài $c"; OK=0; fi
   done
+  while IFS= read -r sk; do
+    [ -n "$sk" ] || continue
+    if ls "$AGY_PLUGINS_DIR"/*/skills/"$sk"/SKILL.md >/dev/null 2>&1; then echo "✅ AGY_SKILLS: agy có skill $sk"
+    else echo "⚠️  AGY_SKILLS: không thấy skill '$sk' trong $AGY_PLUGINS_DIR — agy sẽ bỏ qua (cài: agy plugin install https://github.com/addyosmani/agent-skills.git)"; fi
+  done < <(skill_items)
   if load_plan; then echo "✅ PLAN.md hợp lệ: $TOTAL task, TEST_CMD: $TEST_CMD"
   else echo "❌ PLAN.md: $PLAN_ERR"; OK=0; fi
   if git rev-parse --git-dir >/dev/null 2>&1; then

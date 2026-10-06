@@ -49,7 +49,7 @@ finding to report.
 |--------|-------|-----------|-------------|
 | shellcheck warnings | 5 (all SC2034 in `tests/*.sh`: variables read by functions sourced from `auto.sh`) | must not grow | `make check-full` |
 | shellcheck notes (info + style) | 24 | must not grow | `make check-full` |
-| Pipeline regression cases | 15 + 10 | must not fall | the two `tests/*.sh` scripts |
+| Pipeline regression cases | 18 + 10 | must not fall | the two `tests/*.sh` scripts |
 | pytest tests | 120 | must not fall | `.venv/bin/python -m pytest -q` |
 
 ## Not applicable
