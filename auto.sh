@@ -10,6 +10,8 @@
 #   ./auto.sh --stop-after    (từ tab khác, trong repo) lần chạy đang chạy dừng sau khi task hiện tại xong;
 #                             huỷ yêu cầu: ./auto.sh --no-stop-after
 #   ./auto.sh --notify-test   gửi thử một thông báo (Mac + ntfy nếu có NTFY_TOPIC) rồi thoát
+#   ./auto.sh --install-skills chép bộ skill của autowf (thư mục skills/, xem skills/README.md) vào .claude/skills/
+#                             của repo hiện tại cho Claude Code; skill đã có thì giữ nguyên, không ghi đè
 #   ./auto.sh --adopt N       nhận Task N đã làm/kiểm tra bằng tay: chạy TEST_CMD rồi commit thay đổi (hoặc
 #                             đổi tên commit HEAD) thành "Task N: <tiêu đề>" để lần chạy sau bỏ qua
 #
@@ -38,6 +40,9 @@
 #   AGY_SKILLS=            skill của plugin agent-skills mà agy phải theo, cách nhau bằng dấu cách hoặc phẩy (ví dụ
 #                          "test-driven-development debugging-and-error-recovery"); rỗng = không nhắc skill nào.
 #                          Mỗi skill agy nạp đều tốn thêm token; cần `agy plugin install` agent-skills trước
+#   AGY_SKILLS_PLUGIN=agent-skills  plugin chứa các skill trong AGY_SKILLS (agy được nhắc dùng /<plugin>:<skill>)
+#   AUTOWF_SKILLS_DIR=     thư mục skill cho --install-skills (mặc định: skills/ cạnh auto.sh, rồi
+#                          ~/project4fun/automaticWorkFlow/skills)
 #   AGY_TOKEN_WARN=3000000 cảnh báo khi tổng token input của agy trong một task vượt ngưỡng (0 = tắt);
 #                          số lần gọi model / token của agy từng task ghi trong summary.md
 #   AGY_WATCH=1            in từng bước agy đang làm (đọc file, chạy lệnh, sửa file, lỗi) ra màn hình khi chạy task;
@@ -69,6 +74,7 @@ NEW_BRANCH=0
 CHECK_ONLY=0
 PREFLIGHT_ONLY=0
 NOTIFY_TEST=0
+INSTALL_SKILLS=0
 STOP_AFTER=""
 ADOPT=""
 DESC=""
@@ -77,6 +83,7 @@ while [ $# -gt 0 ]; do
     --new-branch) NEW_BRANCH=1 ;;
     --check)      CHECK_ONLY=1 ;;
     --notify-test) NOTIFY_TEST=1 ;;
+    --install-skills) INSTALL_SKILLS=1 ;;
     --stop-after)  STOP_AFTER=on ;;
     --no-stop-after) STOP_AFTER=off ;;
     --preflight)  PREFLIGHT_ONLY=1 ;;
@@ -115,7 +122,7 @@ if [ -d .venv/bin ] && [ -z "${VIRTUAL_ENV:-}" ]; then
 fi
 
 # ---- Cấu hình: mặc định < .autowf.env < biến môi trường ----
-CONFIG_VARS="NTFY_TOPIC NTFY_SERVER CODER FALLBACK_CODER REVIEWER PLAN_MODEL REVIEW_MODEL PLAN_EFFORT REVIEW_EFFORT MAX_TRIES MAX_EXTRA_TRIES MAX_WAIT_HOURS DIFF_LIMIT AGY_ALLOWED_CMDS AGY_ALLOW_MCP AGY_SKILLS REQUIRE_CMD REQUIRE_WAIT_MINS AGY_TOKEN_WARN"
+CONFIG_VARS="NTFY_TOPIC NTFY_SERVER CODER FALLBACK_CODER REVIEWER PLAN_MODEL REVIEW_MODEL PLAN_EFFORT REVIEW_EFFORT MAX_TRIES MAX_EXTRA_TRIES MAX_WAIT_HOURS DIFF_LIMIT AGY_ALLOWED_CMDS AGY_ALLOW_MCP AGY_SKILLS AGY_SKILLS_PLUGIN AUTOWF_SKILLS_DIR REQUIRE_CMD REQUIRE_WAIT_MINS AGY_TOKEN_WARN"
 if [ -f .autowf.env ]; then
   ENV_OVERRIDES=""
   for v in $CONFIG_VARS; do
@@ -172,6 +179,7 @@ AGY_ALLOWED_CMDS="${AGY_ALLOWED_CMDS:-git, python3, .venv/bin/python, .venv/bin/
 AGY_ALLOW_MCP="${AGY_ALLOW_MCP:-}"
 # Skill của plugin agent-skills mà agy phải theo khi làm task (rỗng = không nhắc)
 AGY_SKILLS="${AGY_SKILLS:-}"
+AGY_SKILLS_PLUGIN="${AGY_SKILLS_PLUGIN:-agent-skills}"
 # Cảnh báo khi tổng token input của agy trong một task vượt ngưỡng này (0 = tắt)
 AGY_TOKEN_WARN="${AGY_TOKEN_WARN:-3000000}"
 # In từng bước agy đang làm ra màn hình khi chạy task (0 = tắt)
@@ -360,9 +368,9 @@ skill_items() { printf '%s\n' "$AGY_SKILLS" | tr -s ', ' '\n' | { grep -v '^$' |
 # skill hay bảo agent tự commit hoặc hỏi lại người dùng, hai việc pipeline không cho phép.
 agy_skills_rule() {
   local list
-  list=$(skill_items | sed 's#^#/agent-skills:#' | paste -sd, - | sed 's/,/, /g')
+  list=$(skill_items | sed "s#^#/${AGY_SKILLS_PLUGIN:-agent-skills}:#" | paste -sd, - | sed 's/,/, /g')
   [ -n "$list" ] || return 0
-  echo " Follow these agent-skills workflows where they apply to this task: $list. They never override the command rules above; do not run git commit and do not stop to ask questions, even when a skill says to."
+  echo " Follow these ${AGY_SKILLS_PLUGIN:-agent-skills} workflows where they apply to this task: $list. They never override the command rules above; do not run git commit and do not stop to ask questions, even when a skill says to."
 }
 AGY_RULES+="$(agy_skills_rule)"
 CODER_RC=0
@@ -1110,6 +1118,35 @@ if [ "$NOTIFY_TEST" -eq 1 ]; then
   exit 0
 fi
 
+# ---- --install-skills ----
+# Thư mục skill nguồn: AUTOWF_SKILLS_DIR, rồi skills/ cạnh script, rồi bản clone mặc định
+skills_src() {
+  local d
+  for d in "${AUTOWF_SKILLS_DIR:-}" "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/skills" "$HOME/project4fun/automaticWorkFlow/skills"; do
+    if [ -n "$d" ] && [ -d "$d" ] && ls "$d"/*/SKILL.md >/dev/null 2>&1; then echo "$d"; return 0; fi
+  done
+  return 1
+}
+# install_skills <nguồn> <đích> — chép từng thư mục có SKILL.md; thư mục đã có ở đích thì bỏ qua
+install_skills() {
+  local src="$1" dest="$2" dir name added=0 kept=0
+  mkdir -p "$dest"
+  for dir in "$src"/*/; do
+    [ -f "$dir/SKILL.md" ] || continue
+    name=$(basename "$dir")
+    if [ -e "$dest/$name" ]; then kept=$((kept + 1)); echo "   = $name (đã có, giữ nguyên)"
+    else cp -R "${dir%/}" "$dest/$name"; added=$((added + 1)); echo "   + $name"; fi
+  done
+  echo "✅ Đã chép $added skill vào $dest ($kept skill đã có được giữ nguyên)"
+}
+if [ "$INSTALL_SKILLS" -eq 1 ]; then
+  SRC=$(skills_src) || { echo "❌ Không tìm thấy thư mục skill. Đặt AUTOWF_SKILLS_DIR=<repo AutoWorkFlow>/skills rồi chạy lại"; exit 1; }
+  echo "📚 Chép skill từ $SRC"
+  install_skills "$SRC" .claude/skills
+  echo "ℹ️  Commit .claude/skills (autowf không chạy khi repo còn thay đổi chưa commit). Bắt đầu: /setup-matt-pocock-skills"
+  exit 0
+fi
+
 # ---- --check ----
 if [ "$CHECK_ONLY" -eq 1 ]; then
   OK=1
@@ -1407,6 +1444,14 @@ parse_verdict() {
 }
 # Nội dung review trừ các dòng kết luận PASS/FAIL
 review_body() { printf '%s\n' "$1" | { grep -vE '^[[:space:]#*`]*(PASS|FAIL)[[:space:]#*`.:]*$|^[[:space:]#*`]*PROGRESS' || true; } | sed -e '/./,$!d'; }
+# Câu nhắc reviewer đọc file chuẩn của repo cho trục Standards (rỗng nếu repo không có file nào)
+review_standards_note() {
+  local files="" f
+  for f in CONSTRAINTS.md CODING_STANDARDS.md GLOSSARY.md; do [ -f "$f" ] && files+="$f, "; done
+  [ -n "$files" ] || return 0
+  printf ' Read %s from the working tree for the Standards axis. A violation of a hard rule there (e.g. a Floor in CONSTRAINTS.md) is blocking; a style preference is a nit.' "${files%, }"
+}
+
 # Số điểm chặn trong một review (gạch đầu dòng, trừ nit và plan-gap)
 blocking_count() { review_body "$1" | { grep -E '^[[:space:]]*[-*][[:space:]]' || true; } | { grep -viE '^[[:space:]]*[-*][[:space:]]*(\*\*)?(nit|plan-gap)' || true; } | wc -l | tr -d ' '; }
 # Dòng 'PROGRESS: a/b' của reviewer → in "a b" (rỗng nếu không có)
@@ -1417,6 +1462,15 @@ test_signature() {
   printf '%s\n' "$1" | { grep -v '^[[:space:]]*$' || true; } | tail -n 5 | sed -E \
     -e 's#(/private)?/(tmp|var/folders)/[^[:space:]:"]*#<tmp>#g' \
     -e 's/(line |:)[0-9]+/\1N/g' -e 's/0x[0-9a-fA-F]+/0xN/g' -e 's/ in [0-9.]+s/ in Ns/g'
+}
+
+# Câu nhắc reviewer đọc tài liệu domain/spec/chuẩn của repo trước khi viết plan (rỗng nếu repo không có)
+plan_context_note() {
+  local files="" f
+  for f in GLOSSARY.md GLOSSARY-MAP.md CONSTRAINTS.md docs/adr; do [ -e "$f" ] && files+="$f, "; done
+  if ls .scratch/*/spec.md >/dev/null 2>&1; then files+=".scratch/*/spec.md, "; fi
+  [ -n "$files" ] || return 0
+  printf -- '- Before writing, read these repo docs and follow them (glossary terms, ADR decisions, quality constraints, specs): %s.' "${files%, }"
 }
 
 # ---- Bước 1: reviewer viết plan ----
@@ -1433,6 +1487,9 @@ MANDATORY format:
 - Keep tasks small (few files, one concern): the coding agent's token cost grows with every file it reads and every step it takes.
 - Make TEST_CMD print compact output (e.g. pytest -q, vitest --reporter=dot, go test without -v): the agent reads that output on every run.
 - Task 1 sets up the project skeleton and test configuration so TEST_CMD runs.
+- Make each task a vertical slice (a narrow but complete path through every layer it touches, verifiable by TEST_CMD on its own), with any prefactoring first.
+- Decide in the plan everything the coding agent would otherwise guess (names, formats, error messages, edge cases); the reviewer stops the run when the plan leaves a decision open.
+$(plan_context_note)
 - Write it so another coding agent can follow it without asking questions." || true
   [ -f PLAN.md ] || stop 1 "$REVIEWER_NAME không tạo được PLAN.md, xem $LOG_DIR/plan.log" "$(tail -n 5 "$LOG_DIR/plan.log" 2>/dev/null || true)"
   git add -A && git commit -qm "PLAN.md"
@@ -1619,7 +1676,7 @@ Log: $LOG_DIR/task$N-try$TRY-test.log (lần trước: $LOG_DIR/task$N-try$((TRY
     } > "$REVIEW_IN"
 
     echo "🔍 $REVIEWER_NAME (${REVIEW_MODEL:-model mặc định}${REVIEW_EFFORT:+, $REVIEW_EFFORT}) đang review..."
-    REVIEW_PROMPT="You are a strict code reviewer. Review Task $N against its acceptance criteria in the PLAN.md excerpt above, using the test results and the diff. Check for bugs, security issues, edge cases and deviations from the plan.
+    REVIEW_PROMPT="You are a strict code reviewer. Review Task $N along two axes. Spec: does the code meet the acceptance criteria in the PLAN.md excerpt above, judged from the test results and the diff (bugs, security issues, edge cases, deviations from the plan)? Standards: does the diff follow the repo's written standards?$(review_standards_note)
 PLAN.md is fixed and approved: never ask the coder to edit PLAN.md; judge the code against it. If the diff is marked TRUNCATED, read the files listed as not shown from the working tree before judging, and never FAIL only because a file is missing from the truncated diff.
 If a PREVIOUS REVIEW section is present, first check every item in it: FAIL if any is still not fixed. Then write one line 'PROGRESS: <fixed>/<total>' = how many of its items are now fixed. For a problem it did not raise, FAIL only if it is a real bug, a security issue or a failing test; anything else is a nit.
 If passing would need a decision PLAN.md does not make (behaviour, scope or requirement the plan does not specify), do not invent it and do not ask the coder to guess: write '- plan-gap: <what PLAN.md does not say> — <options>'. A plan-gap line in a FAIL stops the run for a human decision.

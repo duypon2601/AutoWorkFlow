@@ -1,6 +1,7 @@
 #!/bin/bash
 # Test hồi quy cho phần chẩn đoán log agent của auto.sh (diagnose_agent_log, diag_advice ENV_HOOK,
-# agent_env_fingerprint) và câu nhắc skill cho agy (agy_skills_rule). Chạy: bash tests/diagnose_test.sh — exit ≠ 0 nếu có mục sai.
+# agent_env_fingerprint), câu nhắc skill cho agy (agy_skills_rule), câu nhắc tài liệu repo cho reviewer
+# (plan_context_note, review_standards_note) và --install-skills (install_skills). Chạy: bash tests/diagnose_test.sh — exit ≠ 0 nếu có mục sai.
 # Fixture env-hook-*/permission-* là log thật (đổi tên user); quota/crash/prose là log dựng tay.
 set -uo pipefail
 
@@ -14,7 +15,7 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 tr -d '\r' < "$AUTO" | awk '
   /^DIAG_[A-Z_]+=/ { print; next }
   /^skill_items\(\) \{.*\}$/ { print; next }
-  /^(diag_tool_lines|diagnose_agent_log|diag_advice|agent_env_fingerprint|agy_skills_rule)\(\) \{/ { infn = 1 }
+  /^(diag_tool_lines|diagnose_agent_log|diag_advice|agent_env_fingerprint|agy_skills_rule|plan_context_note|review_standards_note|install_skills)\(\) \{/ { infn = 1 }
   infn { print; if ($0 ~ /^}/) infn = 0 }
 ' > "$TMP/lib.sh"
 # shellcheck source=/dev/null
@@ -86,6 +87,39 @@ case "$out" in
   *"do not run git commit"*) ok "nhắc luật lệnh vẫn thắng skill (không commit)" ;;
   *) bad "không nhắc cấm commit: $out" ;;
 esac
+
+out=$(AGY_SKILLS="tdd" AGY_SKILLS_PLUGIN="mattpocock-skills" agy_skills_rule)
+case "$out" in
+  *"/mattpocock-skills:tdd."*) ok "AGY_SKILLS_PLUGIN đổi tiền tố skill" ;;
+  *) bad "AGY_SKILLS_PLUGIN không được dùng: $out" ;;
+esac
+
+echo "plan_context_note / review_standards_note"
+mkdir -p "$TMP/repo-empty" "$TMP/repo-docs/docs/adr" "$TMP/repo-docs/.scratch/login"
+touch "$TMP/repo-docs/GLOSSARY.md" "$TMP/repo-docs/CONSTRAINTS.md" "$TMP/repo-docs/.scratch/login/spec.md"
+if [ -z "$(cd "$TMP/repo-empty" && plan_context_note)" ] && [ -z "$(cd "$TMP/repo-empty" && review_standards_note)" ]; then
+  ok "repo không có tài liệu → không thêm gì vào prompt"
+else bad "repo không có tài liệu mà vẫn thêm câu nhắc"; fi
+out=$(cd "$TMP/repo-docs" && plan_context_note)
+case "$out" in
+  "- Before writing"*"GLOSSARY.md, CONSTRAINTS.md, docs/adr, .scratch/*/spec.md.") ok "plan: liệt kê glossary, constraints, ADR, spec" ;;
+  *) bad "plan_context_note sai: $out" ;;
+esac
+out=$(cd "$TMP/repo-docs" && review_standards_note)
+case "$out" in
+  *"Read CONSTRAINTS.md, GLOSSARY.md from the working tree"*"blocking"*) ok "review: liệt kê file chuẩn cho trục Standards" ;;
+  *) bad "review_standards_note sai: $out" ;;
+esac
+
+echo "install_skills"
+mkdir -p "$TMP/src/alpha" "$TMP/src/beta/agents" "$TMP/src/not-a-skill" "$TMP/dest/beta"
+echo a > "$TMP/src/alpha/SKILL.md"; echo b > "$TMP/src/beta/SKILL.md"; echo y > "$TMP/src/beta/agents/x.yaml"
+echo mine > "$TMP/dest/beta/SKILL.md"
+install_skills "$TMP/src" "$TMP/dest" > "$TMP/install.log"
+if [ -f "$TMP/dest/alpha/SKILL.md" ]; then ok "chép skill mới"; else bad "không chép alpha"; fi
+if [ "$(cat "$TMP/dest/beta/SKILL.md")" = mine ]; then ok "skill đã có ở đích được giữ nguyên"; else bad "ghi đè skill đã có"; fi
+if [ ! -e "$TMP/dest/not-a-skill" ]; then ok "bỏ qua thư mục không có SKILL.md"; else bad "chép thư mục không phải skill"; fi
+if grep -qF "Đã chép 1 skill" "$TMP/install.log"; then ok "báo đúng số skill đã chép"; else bad "báo sai: $(cat "$TMP/install.log")"; fi
 
 echo "Kết quả: $pass đạt, $fail sai"
 [ "$fail" -eq 0 ]
