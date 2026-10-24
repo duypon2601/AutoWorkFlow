@@ -36,6 +36,8 @@ Run `make check-task` before calling a change to `auto.sh` done.
 - `todo/`, `tests/test_*.py`, `PLAN.md`, `PROGRESS.md`, `README.md` — the sample app, its
   plan, and the agent's progress log.
 - `.auto-logs/`, `REVIEW.md` — pipeline output, git-ignored.
+- `skills/` — Claude Code skills that `--install-skills` copies into a target repo's `.claude/skills/`.
+  Most come from mattpocock/skills; `skills/README.md` lists the source commit and what was changed.
 
 ## Conventions
 - Comments and user-facing messages in `auto.sh` are Vietnamese; commit messages are English.
@@ -72,3 +74,4 @@ Skills are loaded by phase, not in bulk:
 - Before committing: `code-review-and-quality`; `git-workflow-and-versioning` for the commit.
 - Changes to preflight, permissions, allowlists, hooks or anything that runs agent-supplied
   commands: `security-and-hardening`.
+- Editing a skill in `skills/`: `writing-for-agents`; record any change to an upstream skill in `skills/README.md`.
